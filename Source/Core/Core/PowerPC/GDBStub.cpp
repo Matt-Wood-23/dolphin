@@ -1140,6 +1140,19 @@ bool IsActive()
   return s_tmpsock != -1 || s_sock != -1;
 }
 
+void OnAfterStateLoad()
+{
+  // CoreTiming::DoState replaces the live event queue with the one
+  // serialized in the save state, which typically wasn't taken with the
+  // GDB stub connected and therefore has no GDBStubUpdate event scheduled.
+  // Without rescheduling, UpdateCallback never fires again, so the stub
+  // accepts no further packets even though IsActive() still reports true.
+  if (!IsActive() || s_update_event == nullptr)
+    return;
+  Core::System::GetInstance().GetCoreTiming().ScheduleEvent(
+      GDB_UPDATE_CYCLES, s_update_event);
+}
+
 bool HasControl()
 {
   return s_has_control;

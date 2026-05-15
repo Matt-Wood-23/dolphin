@@ -26,4 +26,11 @@ bool JustConnected();
 
 void ProcessCommands(bool loop_until_continue);
 void SendSignal(Signal signal);
+
+// Re-arm the periodic update event after a save-state load wiped the
+// CoreTiming event queue. Without this, the stub stays connected (its
+// sockets are intact and IsActive() returns true) but stops processing
+// packets because the self-rescheduling UpdateCallback never fires again.
+// Call this from Core::State after a successful state load.
+void OnAfterStateLoad();
 }  // namespace GDBStub

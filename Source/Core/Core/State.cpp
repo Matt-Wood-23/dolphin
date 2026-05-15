@@ -43,6 +43,7 @@
 #include "Core/HW/Wiimote.h"
 #include "Core/Movie.h"
 #include "Core/NetPlayProto.h"
+#include "Core/PowerPC/GDBStub.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 
@@ -861,6 +862,11 @@ static void LoadAsFromCore(Core::System& system, std::string filename)
       UndoLoadState(system);
     }
   }
+
+  // CoreTiming::DoState replaces the event queue, dropping the stub's
+  // self-rescheduling update event. Re-arm it so packets keep flowing
+  // after the state load. No-op when no debugger is attached.
+  GDBStub::OnAfterStateLoad();
 
   if (s_on_after_load_callback)
     s_on_after_load_callback();
