@@ -16,6 +16,7 @@ typedef SSIZE_T ssize_t;
 #define SHUT_RDWR SD_BOTH
 #else
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -62,7 +63,11 @@ constexpr u32 NUM_BREAKPOINT_TYPES = 4;
 constexpr int MACH_O_POWERPC = 18;
 constexpr int MACH_O_POWERPC_750 = 9;
 
-const s64 GDB_UPDATE_CYCLES = 100000;
+// Bumped from 100000 to reduce Windows socket-poll overhead. At ~729 MHz
+// Broadway this is ~1.4 ms between polls (down from ~137 us), cutting poll
+// rate ~10x. Breakpoint/watchpoint hit latency is unaffected (event-driven
+// via SendSignal); only command-response latency takes the small hit.
+const s64 GDB_UPDATE_CYCLES = 1000000;
 
 static bool s_has_control = false;
 static bool s_just_connected = false;
@@ -263,7 +268,10 @@ static bool IsDataAvailable()
   FD_SET(s_sock, fds);
 
   t.tv_sec = 0;
-  t.tv_usec = 20;
+  // Non-blocking poll. Previously 20 us, which was a hard sleep on every
+  // CoreTiming tick — measurable Windows emu-thread cost. With 0 the
+  // select returns immediately if no packet is waiting.
+  t.tv_usec = 0;
 
   if (select(s_sock + 1, fds, nullptr, nullptr, &t) < 0)
   {
@@ -339,7 +347,9 @@ static void HandleQuery()
   else if (!strncmp((const char*)(s_cmd_bfr), "qHostInfo", strlen("qHostInfo")))
     return WriteHostInfo();
   else if (!strncmp((const char*)(s_cmd_bfr), "qSupported", strlen("qSupported")))
-    return SendReply("swbreak+;hwbreak+");
+    // PacketSize=2710 (10000 hex) matches GDB_BFR_MAX so clients can issue
+    // large memory reads in a single packet instead of the 400-byte default.
+    return SendReply("PacketSize=2710;swbreak+;hwbreak+");
 
   SendReply("");
 }
@@ -1102,6 +1112,13 @@ static void InitGeneric(int domain, const sockaddr* server_addr, socklen_t serve
   if (s_sock < 0)
     ERROR_LOG_FMT(GDB_STUB, "Failed to accept gdb client");
   INFO_LOG_FMT(GDB_STUB, "Client connected.");
+
+  // Disable Nagle on the client connection. GDB exchanges are mostly small
+  // request/short-reply pairs; Nagle's 40 ms coalescing stalls every one.
+  int nodelay = 1;
+  if (setsockopt(s_sock, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof nodelay) < 0)
+    ERROR_LOG_FMT(GDB_STUB, "Failed to setsockopt TCP_NODELAY");
+
   s_just_connected = true;
 
 #ifdef _WIN32
