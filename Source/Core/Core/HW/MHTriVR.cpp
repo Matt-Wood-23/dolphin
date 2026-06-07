@@ -283,8 +283,20 @@ void CamPostHook(const Core::CPUThreadGuard& guard)
       static bool s_was_recenter = false;
       const bool recenter = (GetAsyncKeyState(VK_RCONTROL) & 0x8000) != 0;
       if (recenter && !s_was_recenter)
-        s_fp_recenter.store(az_follow - facing * s_fp_yaw_sign.load() -
-                            s_fp_yaw_offset.load() - head_yaw);
+      {
+        if (s_fp_follow_base.load())
+        {
+          // Follow-base auto-tracks the camera, so the only orientation fix needed
+          // is the 180° flip (e.g. an area that loaded backwards) — toggle it live.
+          s_fp_recenter_flip.store(!s_fp_recenter_flip.load());
+        }
+        else
+        {
+          // World-locked: snap the fixed view heading to the hunter's current facing.
+          s_fp_recenter.store(az_follow - facing * s_fp_yaw_sign.load() -
+                              s_fp_yaw_offset.load() - head_yaw);
+        }
+      }
       s_was_recenter = recenter;
 #endif
 
