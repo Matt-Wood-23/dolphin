@@ -11,6 +11,7 @@
 #include <cstdlib>
 
 #include "Common/CommonTypes.h"
+#include "Common/FileUtil.h"
 #include "Common/Logging/Log.h"
 
 #include "Core/ConfigManager.h"
@@ -90,13 +91,18 @@ constexpr u32 kPlayerWorkPtr = 0x806BBC74;   // -> player_work base
 constexpr u32 kPlwPosOff = 0x48;             // vec3 current position
 constexpr u32 kPlwFacingOff = 0xD8;          // s16 facing yaw (BAMS)
 
-// Live config (shared with VROpenXR's reader). Re-read every N frames from the
-// CPU thread so eye-height / look direction can be tuned in-headset on the fly.
-constexpr const char* kConfigPath = "D:/Matt/Games/dolphin-fork/mhtri_vr_config.txt";
+// Live config (shared with VROpenXR's reader): mhtri_vr_config.txt next to the
+// Dolphin executable. Re-read every N frames from the CPU thread so eye-height /
+// look direction can be tuned in-headset on the fly.
+const std::string& ConfigPath()
+{
+  static const std::string path = File::GetExeDirectory() + "/mhtri_vr_config.txt";
+  return path;
+}
 
 void ReadFPConfig()
 {
-  std::FILE* f = std::fopen(kConfigPath, "rb");
+  std::FILE* f = std::fopen(ConfigPath().c_str(), "rb");
   if (f == nullptr)
     return;
   char line[256];

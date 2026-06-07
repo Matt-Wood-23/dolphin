@@ -32,6 +32,7 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
+#include "Common/FileUtil.h"
 #include "Common/Logging/Log.h"
 
 #include "VideoCommon/VRStereo.h"
@@ -228,12 +229,12 @@ void FrameResult(const char* msg)
   }
 }
 
-// Live VR tuning: re-read a small key=value config file so values can be tuned
-// without relaunching (env vars don't inherit reliably through the launcher).
-// Keys: fov_scale, depth, convergence. TEMP (fold into a real UI later).
+// Live VR tuning: re-read a small key=value config file (mhtri_vr_config.txt next
+// to the Dolphin executable) so values can be tuned without relaunching.
 void ReadVRConfig()
 {
-  FILE* f = std::fopen("D:/Matt/Games/dolphin-fork/mhtri_vr_config.txt", "r");
+  static const std::string config_path = File::GetExeDirectory() + "/mhtri_vr_config.txt";
+  FILE* f = std::fopen(config_path.c_str(), "r");
   if (f == nullptr)
     return;
   char line[128];
