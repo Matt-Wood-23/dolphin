@@ -7,6 +7,7 @@
 #include <atomic>
 #include <bit>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 
 #include "Common/CommonTypes.h"
@@ -53,6 +54,62 @@ std::atomic<bool> s_have_external_pose{false};  // OpenXR/SetHeadPose authoritat
 std::atomic<bool> s_mouse{true};   // Win32 relative-mouse look (hold Left Alt)
 std::atomic<bool> s_demo{false};   // env-gated yaw oscillator (no-input smoke test)
 u32 s_frames = 0;  // oscillator phase (hook thread only)
+
+// --- First-person (Mode B) rig -------------------------------------------------
+// Instead of head-look on the 3rd-person follow cam, place the rendered eye AT the
+// player's head and aim it with (body facing + HMD head yaw/pitch). This makes the
+// game first-person — the prerequisite for true wrap-around VR immersion. We don't
+// need to neuter cam_follow_update: we just overwrite the eye/target the commit is
+// about to push. Tunables live in mhtri_vr_config.txt (re-read live; no rebuild).
+//
+//   PLW (player_work) ptr  @ 0x806BBC74 (g_aggregate_p1_ptr, cached by the cam)
+//   PLW+0x48 = pos vec3 {X, Y(up), Z}   (live-verified, facts/01)
+//   PLW+0xD8 = s16 facing yaw, BAMS     (deg = val*360/65536)
+std::atomic<bool> s_fp{false};            // first-person mode on/off
+std::atomic<float> s_fp_eye_height{150.0f};  // world units added to player Y for the eye
+std::atomic<float> s_fp_eye_forward{0.0f};   // push eye forward along view (out of the model)
+std::atomic<float> s_fp_look_dist{300.0f};   // eye->target length (direction only matters)
+std::atomic<float> s_fp_yaw_offset{0.0f};    // radians added to body facing (tune forward)
+std::atomic<float> s_fp_yaw_sign{1.0f};      // +1/-1 flips facing rotation sense
+std::atomic<float> s_fp_head_yaw_sign{-1.0f};  // +1/-1 flips HMD yaw sense (Mode-A match)
+std::atomic<float> s_fp_head_pitch_sign{1.0f};  // +1/-1 flips HMD pitch sense
+constexpr u32 kPlayerWorkPtr = 0x806BBC74;   // -> player_work base
+constexpr u32 kPlwPosOff = 0x48;             // vec3 current position
+constexpr u32 kPlwFacingOff = 0xD8;          // s16 facing yaw (BAMS)
+
+// Live config (shared with VROpenXR's reader). Re-read every N frames from the
+// CPU thread so eye-height / look direction can be tuned in-headset on the fly.
+constexpr const char* kConfigPath = "D:/Matt/Games/dolphin-fork/mhtri_vr_config.txt";
+
+void ReadFPConfig()
+{
+  std::FILE* f = std::fopen(kConfigPath, "rb");
+  if (f == nullptr)
+    return;
+  char line[256];
+  while (std::fgets(line, sizeof(line), f) != nullptr)
+  {
+    float v;
+    int iv;
+    if (std::sscanf(line, "firstperson=%d", &iv) == 1)
+      s_fp.store(iv != 0);
+    else if (std::sscanf(line, "eye_height=%f", &v) == 1)
+      s_fp_eye_height.store(v);
+    else if (std::sscanf(line, "eye_forward=%f", &v) == 1)
+      s_fp_eye_forward.store(v);
+    else if (std::sscanf(line, "look_dist=%f", &v) == 1)
+      s_fp_look_dist.store(v);
+    else if (std::sscanf(line, "fp_yaw_offset=%f", &v) == 1)
+      s_fp_yaw_offset.store(v);
+    else if (std::sscanf(line, "fp_yaw_sign=%f", &v) == 1)
+      s_fp_yaw_sign.store(v);
+    else if (std::sscanf(line, "fp_head_yaw_sign=%f", &v) == 1)
+      s_fp_head_yaw_sign.store(v);
+    else if (std::sscanf(line, "fp_head_pitch_sign=%f", &v) == 1)
+      s_fp_head_pitch_sign.store(v);
+  }
+  std::fclose(f);
+}
 
 // Self-contained mouse-look: while the engage key (Left Alt) is held, relative
 // mouse motion accumulates into the head yaw/pitch and the cursor is recentered
@@ -134,28 +191,27 @@ void CamPostHook(const Core::CPUThreadGuard& guard)
 
   // Determine the head-look offset. Priority: live OpenXR HMD tracking > mouse-look
   // / external pose (s_have_external_pose) > the env-gated oscillator > identity.
-  float yaw, pitch;
+  // In first-person mode we still want to place the eye even when the head is
+  // centered, so a zero pose is valid there (have_pose just gates Mode-A below).
+  float yaw = 0.0f, pitch = 0.0f;
+  bool have_pose = false;
   if (VROpenXR::GetHeadPose(yaw, pitch))
   {
-    // Real headset orientation drives the in-game camera (Phase 3b).
+    have_pose = true;  // Real headset orientation drives the camera (Phase 3b).
   }
   else if (s_have_external_pose.load())
   {
     yaw = s_yaw.load();
     pitch = s_pitch.load();
+    have_pose = true;
   }
   else if (s_demo.load())
   {
     ++s_frames;
     yaw = 0.5f * std::sin(static_cast<float>(s_frames) * 0.02f);  // +/-0.5 rad pan
     pitch = 0.0f;
+    have_pose = true;
   }
-  else
-  {
-    return;  // safe default: leave the game camera untouched
-  }
-  if (yaw == 0.0f && pitch == 0.0f)
-    return;
 
   const auto rd = [&guard](u32 addr) {
     return std::bit_cast<float>(PowerPC::MMU::HostRead<u32>(guard, addr));
@@ -163,6 +219,56 @@ void CamPostHook(const Core::CPUThreadGuard& guard)
   const auto wr = [&guard](u32 addr, float v) {
     PowerPC::MMU::HostWrite<u32>(guard, std::bit_cast<u32>(v), addr);
   };
+
+  // First-person (Mode B): live-tunable, re-read config every ~48 frames. Eye is
+  // placed at the player head; look direction = body facing + HMD head yaw/pitch.
+  if ((s_frames++ & 0x2F) == 0)
+    ReadFPConfig();
+  if (s_fp.load())
+  {
+    // player_work lives in MEM2 (0x90xxxxxx) on this title, so accept either RAM.
+    const auto in_ram = [](u32 a) {
+      return (a >= 0x80000000 && a < 0x81800000) || (a >= 0x90000000 && a < 0x94000000);
+    };
+    const u32 plw = PowerPC::MMU::HostRead<u32>(guard, kPlayerWorkPtr);
+    if (in_ram(plw))
+    {
+      const float px = rd(plw + kPlwPosOff + 0);
+      const float py = rd(plw + kPlwPosOff + 4);
+      const float pz = rd(plw + kPlwPosOff + 8);
+      const auto facing_bams =
+          static_cast<s16>(PowerPC::MMU::HostRead<u16>(guard, plw + kPlwFacingOff));
+      const float facing = static_cast<float>(facing_bams) * (2.0f * kPi / 65536.0f);
+      // HMD yaw sense must match the working Mode-A head-look (azimuth decreases
+      // with +head-yaw), hence the per-axis head sign knobs.
+      const float head_yaw = yaw * s_fp_head_yaw_sign.load();
+      const float head_pitch = pitch * s_fp_head_pitch_sign.load();
+      const float total_yaw =
+          facing * s_fp_yaw_sign.load() + s_fp_yaw_offset.load() + head_yaw;
+      const float cp = std::cos(head_pitch);
+      const float fx = std::sin(total_yaw) * cp;
+      const float fy = std::sin(head_pitch);
+      const float fz = std::cos(total_yaw) * cp;
+      // Push the eye forward along the horizontal view direction so it leaves the
+      // player model (otherwise you're rendering from inside the hunter's head).
+      const float ef = s_fp_eye_forward.load();
+      const float ex = px + std::sin(total_yaw) * ef;
+      const float ey = py + s_fp_eye_height.load();
+      const float ez = pz + std::cos(total_yaw) * ef;
+      const float d = s_fp_look_dist.load();
+      wr(eye_ptr + 0, ex);
+      wr(eye_ptr + 4, ey);
+      wr(eye_ptr + 8, ez);
+      wr(tgt_ptr + 0, ex + fx * d);
+      wr(tgt_ptr + 4, ey + fy * d);
+      wr(tgt_ptr + 8, ez + fz * d);
+    }
+    return;
+  }
+
+  // Mode A (head-look on the follow cam): only when a head pose is present.
+  if (!have_pose || (yaw == 0.0f && pitch == 0.0f))
+    return;
 
   // Eye/target being committed (big-endian f32 vec3s).
   const float ex = rd(eye_ptr + 0);
@@ -247,6 +353,13 @@ void TryInstall(Core::System& system)
     if (const float v = std::strtof(fov, nullptr); v > 0.0f)
       VROpenXR::SetFovScale(v);
   }
+
+  // First-person (Mode B): MHTRI_VR_FP=1 starts in first person; otherwise it's
+  // driven live by `firstperson=` in mhtri_vr_config.txt (re-read each frame).
+  if (const char* fp = std::getenv("MHTRI_VR_FP"); fp != nullptr && fp[0] == '1')
+    s_fp.store(true);
+  // Prime the live config once at install so eye-height etc. are set before frame 0.
+  ReadFPConfig();
 
   // Fixed-address Start hook: runs CamPostHook, then the original instruction at
   // kHookAddr (li r0,0xff) executes normally and the function continues.
