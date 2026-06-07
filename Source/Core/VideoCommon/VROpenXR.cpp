@@ -108,6 +108,29 @@ XrResult s_last_endframe = XR_SUCCESS;
 XrCompositionLayerProjectionView s_proj_views[kEyeCount] = {
     {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
 
+// --- VR controller input (Touch) -------------------------------------------------
+// Action set + actions created at session attach; synced each frame in RunFrame;
+// latched into atomics read by Core (GetControllerState) on the CPU thread.
+XrActionSet s_action_set = XR_NULL_HANDLE;
+XrAction s_act_lstick = XR_NULL_HANDLE;   // Vector2f
+XrAction s_act_rstick = XR_NULL_HANDLE;   // Vector2f
+XrAction s_act_ltrig = XR_NULL_HANDLE;    // float
+XrAction s_act_rtrig = XR_NULL_HANDLE;    // float
+XrAction s_act_lgrip = XR_NULL_HANDLE;    // float
+XrAction s_act_rgrip = XR_NULL_HANDLE;    // float
+XrAction s_act_a = XR_NULL_HANDLE;        // boolean (right A)
+XrAction s_act_b = XR_NULL_HANDLE;        // boolean (right B)
+XrAction s_act_x = XR_NULL_HANDLE;        // boolean (left X)
+XrAction s_act_y = XR_NULL_HANDLE;        // boolean (left Y)
+XrAction s_act_lclick = XR_NULL_HANDLE;   // boolean (left stick click)
+XrAction s_act_rclick = XR_NULL_HANDLE;   // boolean (right stick click)
+XrAction s_act_menu = XR_NULL_HANDLE;     // boolean (left menu)
+std::atomic<bool> s_input_valid{false};
+std::atomic<float> s_in_lx{0.0f}, s_in_ly{0.0f}, s_in_rx{0.0f}, s_in_ry{0.0f};
+std::atomic<float> s_in_ltrig{0.0f}, s_in_rtrig{0.0f}, s_in_lgrip{0.0f}, s_in_rgrip{0.0f};
+std::atomic<bool> s_in_a{false}, s_in_b{false}, s_in_x{false}, s_in_y{false};
+std::atomic<bool> s_in_lclick{false}, s_in_rclick{false}, s_in_menu{false};
+
 // KHR_vulkan_enable entry points (loaded via xrGetInstanceProcAddr).
 PFN_xrGetVulkanGraphicsRequirementsKHR s_xrGetVulkanGraphicsRequirementsKHR = nullptr;
 PFN_xrGetVulkanInstanceExtensionsKHR s_xrGetVulkanInstanceExtensionsKHR = nullptr;
@@ -234,6 +257,132 @@ void ReadVRConfig()
   std::fclose(f);
 }
 
+// Create the gameplay action set + Touch bindings and attach it to the session.
+// Must run once, after the session exists, before xrSyncActions. Failure here is
+// non-fatal (HMD head tracking + render still work; only controllers go dark).
+void CreateInputActions()
+{
+  if (s_action_set != XR_NULL_HANDLE || s_session == XR_NULL_HANDLE)
+    return;
+
+  XrActionSetCreateInfo asci{XR_TYPE_ACTION_SET_CREATE_INFO};
+  std::strcpy(asci.actionSetName, "gameplay");
+  std::strcpy(asci.localizedActionSetName, "Gameplay");
+  asci.priority = 0;
+  if (XR_FAILED(xrCreateActionSet(s_instance, &asci, &s_action_set)))
+  {
+    s_action_set = XR_NULL_HANDLE;
+    return;
+  }
+
+  const auto make = [&](const char* name, XrActionType type, XrAction* out) {
+    XrActionCreateInfo aci{XR_TYPE_ACTION_CREATE_INFO};
+    std::strcpy(aci.actionName, name);
+    std::strcpy(aci.localizedActionName, name);
+    aci.actionType = type;
+    xrCreateAction(s_action_set, &aci, out);
+  };
+  make("lstick", XR_ACTION_TYPE_VECTOR2F_INPUT, &s_act_lstick);
+  make("rstick", XR_ACTION_TYPE_VECTOR2F_INPUT, &s_act_rstick);
+  make("ltrigger", XR_ACTION_TYPE_FLOAT_INPUT, &s_act_ltrig);
+  make("rtrigger", XR_ACTION_TYPE_FLOAT_INPUT, &s_act_rtrig);
+  make("lgrip", XR_ACTION_TYPE_FLOAT_INPUT, &s_act_lgrip);
+  make("rgrip", XR_ACTION_TYPE_FLOAT_INPUT, &s_act_rgrip);
+  make("btn_a", XR_ACTION_TYPE_BOOLEAN_INPUT, &s_act_a);
+  make("btn_b", XR_ACTION_TYPE_BOOLEAN_INPUT, &s_act_b);
+  make("btn_x", XR_ACTION_TYPE_BOOLEAN_INPUT, &s_act_x);
+  make("btn_y", XR_ACTION_TYPE_BOOLEAN_INPUT, &s_act_y);
+  make("lclick", XR_ACTION_TYPE_BOOLEAN_INPUT, &s_act_lclick);
+  make("rclick", XR_ACTION_TYPE_BOOLEAN_INPUT, &s_act_rclick);
+  make("menu", XR_ACTION_TYPE_BOOLEAN_INPUT, &s_act_menu);
+
+  const auto path = [&](const char* s) {
+    XrPath p = XR_NULL_PATH;
+    xrStringToPath(s_instance, s, &p);
+    return p;
+  };
+  const XrActionSuggestedBinding binds[] = {
+      {s_act_lstick, path("/user/hand/left/input/thumbstick")},
+      {s_act_rstick, path("/user/hand/right/input/thumbstick")},
+      {s_act_ltrig, path("/user/hand/left/input/trigger/value")},
+      {s_act_rtrig, path("/user/hand/right/input/trigger/value")},
+      {s_act_lgrip, path("/user/hand/left/input/squeeze/value")},
+      {s_act_rgrip, path("/user/hand/right/input/squeeze/value")},
+      {s_act_a, path("/user/hand/right/input/a/click")},
+      {s_act_b, path("/user/hand/right/input/b/click")},
+      {s_act_x, path("/user/hand/left/input/x/click")},
+      {s_act_y, path("/user/hand/left/input/y/click")},
+      {s_act_lclick, path("/user/hand/left/input/thumbstick/click")},
+      {s_act_rclick, path("/user/hand/right/input/thumbstick/click")},
+      {s_act_menu, path("/user/hand/left/input/menu/click")},
+  };
+  XrInteractionProfileSuggestedBinding sb{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+  sb.interactionProfile = path("/interaction_profiles/oculus/touch_controller");
+  sb.suggestedBindings = binds;
+  sb.countSuggestedBindings = static_cast<u32>(sizeof(binds) / sizeof(binds[0]));
+  xrSuggestInteractionProfileBindings(s_instance, &sb);
+
+  XrSessionActionSetsAttachInfo attach{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
+  attach.countActionSets = 1;
+  attach.actionSets = &s_action_set;
+  xrAttachSessionActionSets(s_session, &attach);
+}
+
+// Sync the action set and latch the controller state into the atomics. Called each
+// frame once the session is running (from RunFrame). No-op until actions attached.
+void SyncInput()
+{
+  if (s_action_set == XR_NULL_HANDLE)
+    return;
+
+  XrActiveActionSet active{s_action_set, XR_NULL_PATH};
+  XrActionsSyncInfo sync{XR_TYPE_ACTIONS_SYNC_INFO};
+  sync.countActiveActionSets = 1;
+  sync.activeActionSets = &active;
+  if (XR_FAILED(xrSyncActions(s_session, &sync)))
+    return;
+
+  const auto vec2 = [&](XrAction a, std::atomic<float>& ox, std::atomic<float>& oy) {
+    XrActionStateGetInfo gi{XR_TYPE_ACTION_STATE_GET_INFO};
+    gi.action = a;
+    XrActionStateVector2f st{XR_TYPE_ACTION_STATE_VECTOR2F};
+    if (XR_SUCCEEDED(xrGetActionStateVector2f(s_session, &gi, &st)) && st.isActive)
+    {
+      ox.store(st.currentState.x);
+      oy.store(st.currentState.y);
+    }
+  };
+  const auto flt = [&](XrAction a, std::atomic<float>& o) {
+    XrActionStateGetInfo gi{XR_TYPE_ACTION_STATE_GET_INFO};
+    gi.action = a;
+    XrActionStateFloat st{XR_TYPE_ACTION_STATE_FLOAT};
+    if (XR_SUCCEEDED(xrGetActionStateFloat(s_session, &gi, &st)) && st.isActive)
+      o.store(st.currentState);
+  };
+  const auto boolean = [&](XrAction a, std::atomic<bool>& o) {
+    XrActionStateGetInfo gi{XR_TYPE_ACTION_STATE_GET_INFO};
+    gi.action = a;
+    XrActionStateBoolean st{XR_TYPE_ACTION_STATE_BOOLEAN};
+    if (XR_SUCCEEDED(xrGetActionStateBoolean(s_session, &gi, &st)) && st.isActive)
+      o.store(st.currentState == XR_TRUE);
+  };
+
+  vec2(s_act_lstick, s_in_lx, s_in_ly);
+  vec2(s_act_rstick, s_in_rx, s_in_ry);
+  flt(s_act_ltrig, s_in_ltrig);
+  flt(s_act_rtrig, s_in_rtrig);
+  flt(s_act_lgrip, s_in_lgrip);
+  flt(s_act_rgrip, s_in_rgrip);
+  boolean(s_act_a, s_in_a);
+  boolean(s_act_b, s_in_b);
+  boolean(s_act_x, s_in_x);
+  boolean(s_act_y, s_in_y);
+  boolean(s_act_lclick, s_in_lclick);
+  boolean(s_act_rclick, s_in_rclick);
+  boolean(s_act_menu, s_in_menu);
+  s_input_valid.store(true);
+}
+
 // Create the XR session bound to Dolphin's Vulkan device, plus the per-eye
 // swapchains and a reference space. Does NOT begin the session or submit frames
 // yet (that's the per-frame state machine in a later step). Called once the
@@ -335,6 +484,9 @@ bool CreateSessionInternal()
   view_space_info.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
   view_space_info.poseInReferenceSpace.orientation.w = 1.0f;
   xrCreateReferenceSpace(s_session, &view_space_info, &s_view_space);
+
+  // Gameplay action set + Touch bindings (controllers). Non-fatal if it fails.
+  CreateInputActions();
 
   NOTICE_LOG_FMT(VIDEO,
                  "MHTriVR/OpenXR: SESSION CREATED. views={} eye0={}x{} eye1={}x{} fmt={} "
@@ -593,6 +745,9 @@ void RunFrame(const AbstractTexture* xfb_stereo_array)
   if (!s_session_running.load())
     return;
 
+  // Latch the Touch controller state for Core to read (GetControllerState).
+  SyncInput();
+
   XrFrameWaitInfo wait_info{XR_TYPE_FRAME_WAIT_INFO};
   XrFrameState frame_state{XR_TYPE_FRAME_STATE};
   if (XR_FAILED(xrWaitFrame(s_session, &wait_info, &frame_state)))
@@ -795,6 +950,31 @@ bool GetHeadPose(float& yaw_rad, float& pitch_rad)
   return true;
 }
 
+bool GetControllerState(VRControllerState* out)
+{
+  if (out == nullptr)
+    return false;
+  if (!s_session_running.load() || !s_input_valid.load())
+    return false;
+  out->valid = true;
+  out->left_x = s_in_lx.load();
+  out->left_y = s_in_ly.load();
+  out->right_x = s_in_rx.load();
+  out->right_y = s_in_ry.load();
+  out->left_trigger = s_in_ltrig.load();
+  out->right_trigger = s_in_rtrig.load();
+  out->left_grip = s_in_lgrip.load();
+  out->right_grip = s_in_rgrip.load();
+  out->a = s_in_a.load();
+  out->b = s_in_b.load();
+  out->x = s_in_x.load();
+  out->y = s_in_y.load();
+  out->left_stick_click = s_in_lclick.load();
+  out->right_stick_click = s_in_rclick.load();
+  out->menu = s_in_menu.load();
+  return true;
+}
+
 // ---- OpenXR <-> Vulkan binding queries (VROpenXR_Vulkan.h) -------------------
 
 const std::vector<std::string>& GetRequiredVulkanInstanceExtensions()
@@ -913,6 +1093,10 @@ void EndFrame()
 {
 }
 bool GetHeadPose(float& /*yaw_rad*/, float& /*pitch_rad*/)
+{
+  return false;
+}
+bool GetControllerState(VRControllerState* /*out*/)
 {
   return false;
 }

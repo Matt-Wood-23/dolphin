@@ -75,4 +75,24 @@ void EndFrame();
 // fills the args while a VR session is delivering tracking; false otherwise (so
 // callers can fall back to mouse). Called from the camera hook on the CPU thread.
 bool GetHeadPose(float& yaw_rad, float& pitch_rad);
+
+// Neutral snapshot of the VR (Touch) controllers — backend-agnostic so Core can
+// map it onto an emulated controller without knowing OpenXR types. Sticks are
+// -1..1, triggers/grips 0..1, buttons pressed=true. Filled by GetControllerState.
+struct VRControllerState
+{
+  bool valid = false;        // false in the default build / no session / no input
+  float left_x = 0.0f, left_y = 0.0f;     // left thumbstick
+  float right_x = 0.0f, right_y = 0.0f;    // right thumbstick
+  float left_trigger = 0.0f, right_trigger = 0.0f;
+  float left_grip = 0.0f, right_grip = 0.0f;
+  bool a = false, b = false, x = false, y = false;  // face buttons (A/B right, X/Y left)
+  bool left_stick_click = false, right_stick_click = false;
+  bool menu = false;
+};
+
+// Copy the latest synced VR controller state. Returns true (and fills *out) only
+// when a session is running and input is live; false otherwise (callers fall back
+// to the physical controller). No-op returning false in the default build.
+bool GetControllerState(VRControllerState* out);
 }  // namespace VROpenXR

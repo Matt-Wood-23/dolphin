@@ -4,9 +4,12 @@
 #include "Core/HW/WiimoteEmu/Extension/Classic.h"
 
 #include <array>
+#include <cmath>
 
 #include "Common/Common.h"
 #include "Common/CommonTypes.h"
+
+#include "VideoCommon/VROpenXR.h"  // MHTriVR: fold VR (Touch) controllers in
 
 #include "Core/HW/WiimoteEmu/Extension/DesiredExtensionState.h"
 #include "Core/HW/WiimoteEmu/WiimoteEmu.h"
@@ -130,6 +133,54 @@ void Classic::BuildDesiredExtensionState(DesiredExtensionState* target_state)
   m_dpad->GetState(&buttons, classic_dpad_bitmasks.data(), m_input_override_function);
 
   classic_data.SetButtons(buttons);
+
+  // MHTriVR: when the VR (Touch) controllers are live, fold their state into the
+  // emulated Classic Controller. Sticks/triggers replace the host beyond a small
+  // deadzone; buttons OR with the host (0 == pressed in ButtonFormat), so a docked
+  // pad still works alongside. Inert in the default build (GetControllerState=false).
+  if (VROpenXR::IsActive())
+  {
+    VROpenXR::VRControllerState vr;
+    if (VROpenXR::GetControllerState(&vr) && vr.valid)
+    {
+      constexpr ControlState kDead = 0.15;
+      if (std::abs(vr.left_x) > kDead || std::abs(vr.left_y) > kDead)
+        classic_data.SetLeftStick(
+            {MapFloat<u8>(vr.left_x, LEFT_STICK_CENTER, 0, LEFT_STICK_RANGE),
+             MapFloat<u8>(vr.left_y, LEFT_STICK_CENTER, 0, LEFT_STICK_RANGE)});
+      if (std::abs(vr.right_x) > kDead || std::abs(vr.right_y) > kDead)
+        classic_data.SetRightStick(
+            {MapFloat<u8>(vr.right_x, RIGHT_STICK_CENTER, 0, RIGHT_STICK_RANGE),
+             MapFloat<u8>(vr.right_y, RIGHT_STICK_CENTER, 0, RIGHT_STICK_RANGE)});
+      if (vr.left_trigger > 0.05f)
+        classic_data.SetLeftTrigger(MapFloat<u8>(vr.left_trigger, 0, 0, TRIGGER_RANGE));
+      if (vr.right_trigger > 0.05f)
+        classic_data.SetRightTrigger(MapFloat<u8>(vr.right_trigger, 0, 0, TRIGGER_RANGE));
+      // 0 == pressed; force-press on VR input (leaves host state otherwise).
+      if (vr.a)
+        classic_data.bt.a = 0;
+      if (vr.b)
+        classic_data.bt.b = 0;
+      if (vr.x)
+        classic_data.bt.x = 0;
+      if (vr.y)
+        classic_data.bt.y = 0;
+      if (vr.left_trigger > 0.5f)
+        classic_data.bt.zl = 0;
+      if (vr.right_trigger > 0.5f)
+        classic_data.bt.zr = 0;
+      if (vr.left_grip > 0.5f)
+        classic_data.bt.lt = 0;  // L shoulder
+      if (vr.right_grip > 0.5f)
+        classic_data.bt.rt = 0;  // R shoulder
+      if (vr.menu)
+        classic_data.bt.plus = 0;
+      if (vr.left_stick_click)
+        classic_data.bt.minus = 0;
+      if (vr.right_stick_click)
+        classic_data.bt.home = 0;
+    }
+  }
 
   target_state->data = classic_data;
 }

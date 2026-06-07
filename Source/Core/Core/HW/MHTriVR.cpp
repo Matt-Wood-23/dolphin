@@ -71,6 +71,11 @@ std::atomic<float> s_fp_eye_forward{0.0f};   // push eye forward along view (out
 std::atomic<float> s_fp_look_dist{300.0f};   // eye->target length (direction only matters)
 std::atomic<float> s_fp_yaw_offset{0.0f};    // radians added to body facing (tune forward)
 std::atomic<float> s_fp_yaw_sign{1.0f};      // +1/-1 flips facing rotation sense
+// Snap-recenter (Right Ctrl): a runtime yaw offset that re-aims the world-locked
+// view at the hunter's CURRENT facing. Kept separate from s_fp_yaw_offset so the
+// live config reload can't clobber it. Calibration-free: we snap to the game's own
+// follow-cam azimuth (read at hook entry), which is in our world coordinates.
+std::atomic<float> s_fp_recenter{0.0f};
 std::atomic<float> s_fp_head_yaw_sign{-1.0f};  // +1/-1 flips HMD yaw sense (Mode-A match)
 std::atomic<float> s_fp_head_pitch_sign{1.0f};  // +1/-1 flips HMD pitch sense
 constexpr u32 kPlayerWorkPtr = 0x806BBC74;   // -> player_work base
@@ -243,8 +248,28 @@ void CamPostHook(const Core::CPUThreadGuard& guard)
       // with +head-yaw), hence the per-axis head sign knobs.
       const float head_yaw = yaw * s_fp_head_yaw_sign.load();
       const float head_pitch = pitch * s_fp_head_pitch_sign.load();
-      const float total_yaw =
-          facing * s_fp_yaw_sign.load() + s_fp_yaw_offset.load() + head_yaw;
+
+      // Snap-recenter (Right Ctrl, rising edge): re-aim the world-locked view at
+      // the hunter's CURRENT facing. The follow-cam's look direction (the ORIGINAL
+      // eye->target, still in g_cam_work at hook entry because cam_follow_update
+      // ran first) points where the body faces, in OUR world coords -> snap to it.
+#ifdef _WIN32
+      static bool s_was_recenter = false;
+      const bool recenter = (GetAsyncKeyState(VK_RCONTROL) & 0x8000) != 0;
+      if (recenter && !s_was_recenter)
+      {
+        const float oex = rd(eye_ptr + 0), oez = rd(eye_ptr + 8);
+        const float otx = rd(tgt_ptr + 0), otz = rd(tgt_ptr + 8);
+        const float az_follow = std::atan2(otx - oex, otz - oez);
+        // Solve recenter so total_yaw (below) == az_follow at this instant.
+        s_fp_recenter.store(az_follow - facing * s_fp_yaw_sign.load() -
+                            s_fp_yaw_offset.load() - head_yaw);
+      }
+      s_was_recenter = recenter;
+#endif
+
+      const float total_yaw = facing * s_fp_yaw_sign.load() + s_fp_yaw_offset.load() +
+                              s_fp_recenter.load() + head_yaw;
       const float cp = std::cos(head_pitch);
       const float fx = std::sin(total_yaw) * cp;
       const float fy = std::sin(head_pitch);
