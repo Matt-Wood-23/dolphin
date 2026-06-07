@@ -13,6 +13,7 @@
 #include "Common/MsgHandler.h"
 
 #include "VideoCommon/DriverDetails.h"
+#include "VideoCommon/VROpenXR_Vulkan.h"
 #include "VideoCommon/VideoCommon.h"
 
 namespace Vulkan
@@ -392,6 +393,12 @@ bool VulkanContext::SelectInstanceExtensions(std::vector<const char*>* extension
     WARN_LOG_FMT(VIDEO, "Vulkan: Debug utils requested, but extension is not available.");
   }
 
+  // MHTriVR Phase 3a: fold in the instance extensions the OpenXR runtime requires
+  // (empty unless OpenXR is active). The names live in persistent VROpenXR storage,
+  // so the c_str() pointers stored here stay valid until vkCreateInstance.
+  for (const std::string& xr_ext : VROpenXR::GetRequiredVulkanInstanceExtensions())
+    AddExtension(xr_ext.c_str(), true);
+
   return true;
 }
 
@@ -670,6 +677,11 @@ bool VulkanContext::SelectDeviceExtensions(bool enable_surface)
         AddExtension(VK_EXT_DEPTH_CLAMP_CONTROL_EXTENSION_NAME, false) &&
         AddExtension(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME, false);
   }
+
+  // MHTriVR Phase 3a: fold in the device extensions the OpenXR runtime requires
+  // (empty unless OpenXR is active). Names live in persistent VROpenXR storage.
+  for (const std::string& xr_ext : VROpenXR::GetRequiredVulkanDeviceExtensions())
+    AddExtension(xr_ext.c_str(), true);
 
   return true;
 }

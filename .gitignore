@@ -46,3 +46,7 @@ CMakeLists.txt.user
 
 # clangd cache for Neovim
 .cache/clangd
+
+# MH Tri VR: temp diagnostic dumps + local live-tuning config (not source)
+/mhtri_openxr_*.txt
+/mhtri_vr_config.txt

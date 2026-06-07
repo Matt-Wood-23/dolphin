@@ -74,6 +74,11 @@ add_library(videocommon
   GeometryShaderGen.h
   GeometryShaderManager.cpp
   GeometryShaderManager.h
+  VRStereo.cpp
+  VRStereo.h
+  VROpenXR.cpp
+  VROpenXR.h
+  VROpenXR_Vulkan.h
   GraphicsModSystem/Config/GraphicsMod.cpp
   GraphicsModSystem/Config/GraphicsMod.h
   GraphicsModSystem/Config/GraphicsModAsset.cpp

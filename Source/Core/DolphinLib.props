@@ -325,6 +325,7 @@
     <ClInclude Include="Core\HW\MagCard\C1231LR.h" />
     <ClInclude Include="Core\HW\MagCard\MagneticCardReader.h" />
     <ClInclude Include="Core\HW\Memmap.h" />
+    <ClInclude Include="Core\HW\MHTriVR.h" />
     <ClInclude Include="Core\HW\MemoryInterface.h" />
     <ClInclude Include="Core\HW\MMIO.h" />
     <ClInclude Include="Core\HW\MMIOHandlers.h" />
@@ -727,6 +728,9 @@
     <ClInclude Include="VideoCommon\FreeLookCamera.h" />
     <ClInclude Include="VideoCommon\GeometryShaderGen.h" />
     <ClInclude Include="VideoCommon\GeometryShaderManager.h" />
+    <ClInclude Include="VideoCommon\VRStereo.h" />
+    <ClInclude Include="VideoCommon\VROpenXR.h" />
+    <ClInclude Include="VideoCommon\VROpenXR_Vulkan.h" />
     <ClInclude Include="VideoCommon\GraphicsModSystem\Config\GraphicsMod.h" />
     <ClInclude Include="VideoCommon\GraphicsModSystem\Config\GraphicsModAsset.h" />
     <ClInclude Include="VideoCommon\GraphicsModSystem\Config\GraphicsModFeature.h" />
@@ -1035,6 +1039,7 @@
     <ClCompile Include="Core\HW\MagCard\C1231LR.cpp" />
     <ClCompile Include="Core\HW\MagCard\MagneticCardReader.cpp" />
     <ClCompile Include="Core\HW\Memmap.cpp" />
+    <ClCompile Include="Core\HW\MHTriVR.cpp" />
     <ClCompile Include="Core\HW\MemoryInterface.cpp" />
     <ClCompile Include="Core\HW\MMIO.cpp" />
     <ClCompile Include="Core\HW\ProcessorInterface.cpp" />
@@ -1410,6 +1415,8 @@
     <ClCompile Include="VideoCommon\FreeLookCamera.cpp" />
     <ClCompile Include="VideoCommon\GeometryShaderGen.cpp" />
     <ClCompile Include="VideoCommon\GeometryShaderManager.cpp" />
+    <ClCompile Include="VideoCommon\VRStereo.cpp" />
+    <ClCompile Include="VideoCommon\VROpenXR.cpp" />
     <ClCompile Include="VideoCommon\GraphicsModSystem\Config\GraphicsMod.cpp" />
     <ClCompile Include="VideoCommon\GraphicsModSystem\Config\GraphicsModAsset.cpp" />
     <ClCompile Include="VideoCommon\GraphicsModSystem\Config\GraphicsModFeature.cpp" />

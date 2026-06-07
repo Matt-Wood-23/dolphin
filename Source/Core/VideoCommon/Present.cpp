@@ -19,6 +19,7 @@
 #include "VideoCommon/FramebufferManager.h"
 #include "VideoCommon/OnScreenUI.h"
 #include "VideoCommon/PostProcessing.h"
+#include "VideoCommon/VROpenXR.h"
 #include "VideoCommon/VertexManagerBase.h"
 #include "VideoCommon/VideoConfig.h"
 #include "VideoCommon/VideoEvents.h"
@@ -875,6 +876,12 @@ void Presenter::Present(PresentInfo* present_info)
 
   UpdateDrawRectangle();
 
+  // MHTriVR Phase 3: drive the OpenXR frame loop (session state machine, head-pose
+  // tracking, and HMD frame submission of the stereo XFB) BEFORE the backbuffer
+  // render pass, so recording the eye blits doesn't disturb the XFB-to-screen
+  // draw. No-op in the default build and until the session exists.
+  VROpenXR::RunFrame(m_xfb_entry ? m_xfb_entry->texture.get() : nullptr);
+
   g_gfx->BeginUtilityDrawing();
   const bool backbuffer_bound = g_gfx->BindBackbuffer({{0.0f, 0.0f, 0.0f, 1.0f}});
 
@@ -913,6 +920,10 @@ void Presenter::Present(PresentInfo* present_info)
 
     g_gfx->PresentBackbuffer();
   }
+
+  // MHTriVR Phase 3c: now that the backbuffer (and our recorded eye blits) have
+  // been submitted, release the eye swapchain images and submit the XR frame.
+  VROpenXR::EndFrame();
 
   if (m_xfb_entry)
   {

@@ -13,10 +13,15 @@
 #include "VideoBackends/Vulkan/VKGfx.h"
 #include "VideoBackends/Vulkan/VKPerfQuery.h"
 #include "VideoBackends/Vulkan/VKSwapChain.h"
+#include "VideoBackends/Vulkan/VKTexture.h"
 #include "VideoBackends/Vulkan/VKVertexManager.h"
 #include "VideoBackends/Vulkan/VulkanContext.h"
 
+#include <algorithm>
+
 #include "VideoCommon/TextureCacheBase.h"
+#include "VideoCommon/VROpenXR.h"
+#include "VideoCommon/VROpenXR_Vulkan.h"
 #include "VideoCommon/VideoConfig.h"
 
 #if defined(VK_USE_PLATFORM_METAL_EXT)
@@ -88,6 +93,63 @@ static bool ShouldEnableDebugUtils(bool enable_validation_layers)
   return enable_validation_layers || IsHostGPULoggingEnabled();
 }
 
+// MHTriVR Phase 3c: record a blit of one stereo XFB layer into an OpenXR eye
+// swapchain image, on Dolphin's active command buffer. Registered with VROpenXR
+// (which is backend-agnostic) so it can drive the copy without depending on the
+// Vulkan backend. Runs on the video thread from Presenter::Present (RunFrame).
+static void MHTriVRBlit(VkImage dst, u32 dst_width, u32 dst_height,
+                        const AbstractTexture* src_xfb, u32 src_layer)
+{
+  if (dst == VK_NULL_HANDLE || src_xfb == nullptr)
+    return;
+
+  if (StateTracker::GetInstance()->InRenderPass())
+    StateTracker::GetInstance()->EndRenderPass();
+
+  const VkCommandBuffer cb = g_command_buffer_mgr->GetCurrentCommandBuffer();
+  const auto* src = static_cast<const VKTexture*>(src_xfb);
+  const u32 layer = std::min(src_layer, src->GetLayers() - 1);  // mono -> both eyes layer 0
+
+  // Source XFB -> TRANSFER_SRC (whole image).
+  src->TransitionToLayout(cb, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+
+  auto barrier = [&](VkImageLayout old_layout, VkImageLayout new_layout, VkAccessFlags src_access,
+                     VkAccessFlags dst_access, VkPipelineStageFlags src_stage,
+                     VkPipelineStageFlags dst_stage) {
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcAccessMask = src_access;
+    b.dstAccessMask = dst_access;
+    b.oldLayout = old_layout;
+    b.newLayout = new_layout;
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = dst;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cb, src_stage, dst_stage, 0, 0, nullptr, 0, nullptr, 1, &b);
+  };
+
+  // Eye image (contents irrelevant) -> TRANSFER_DST.
+  barrier(VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+          VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+          VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+  VkImageBlit region{};
+  region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1};
+  region.srcOffsets[0] = {0, 0, 0};
+  region.srcOffsets[1] = {static_cast<int32_t>(src->GetWidth()),
+                          static_cast<int32_t>(src->GetHeight()), 1};
+  region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  region.dstOffsets[0] = {0, 0, 0};
+  region.dstOffsets[1] = {static_cast<int32_t>(dst_width), static_cast<int32_t>(dst_height), 1};
+  vkCmdBlitImage(cb, src->GetImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
+                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_LINEAR);
+
+  // Eye image -> COLOR_ATTACHMENT_OPTIMAL (what the OpenXR runtime expects).
+  barrier(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+          VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+          VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+}
+
 bool VideoBackend::Initialize(const WindowSystemInfo& wsi)
 {
   if (!LoadVulkanLibrary())
@@ -109,6 +171,15 @@ bool VideoBackend::Initialize(const WindowSystemInfo& wsi)
   bool enable_surface = wsi.type != WindowSystemType::Headless;
   bool enable_debug_utils = ShouldEnableDebugUtils(enable_validation_layer);
   u32 vk_api_version = 0;
+
+  // MHTriVR Phase 3a: bring up OpenXR BEFORE the Vulkan instance, so the runtime's
+  // required instance/device extensions can be folded into Dolphin's own device
+  // (direct OpenXR-Vulkan binding). The MHTRI_VR_OPENXR compile flag is the gate:
+  // this is a no-op in the default build, and a graceful no-op if the headset/
+  // runtime is unavailable. (We can't gate on game ID here — the ID isn't set yet
+  // when the Vulkan backend initializes.)
+  VROpenXR::Initialize();
+
   VkInstance instance = VulkanContext::CreateVulkanInstance(
       wsi.type, enable_debug_utils, enable_validation_layer, &vk_api_version);
   if (instance == VK_NULL_HANDLE)
@@ -165,16 +236,34 @@ bool VideoBackend::Initialize(const WindowSystemInfo& wsi)
     selected_adapter_index = 0;
   }
 
+  // MHTriVR Phase 3a: OpenXR requires rendering on the GPU the HMD is attached to.
+  // If active, override the adapter with the runtime's required physical device.
+  // Returns VK_NULL_HANDLE (no override) in the default build / when inactive.
+  VkPhysicalDevice selected_gpu = gpu_list[selected_adapter_index];
+  if (VkPhysicalDevice xr_gpu = VROpenXR::GetVulkanGraphicsDevice(instance);
+      xr_gpu != VK_NULL_HANDLE)
+  {
+    NOTICE_LOG_FMT(VIDEO, "MHTriVR/OpenXR: overriding Vulkan adapter with the HMD's GPU.");
+    selected_gpu = xr_gpu;
+  }
+
   // Now we can create the Vulkan device. VulkanContext takes ownership of the instance and surface.
-  g_vulkan_context =
-      VulkanContext::Create(instance, gpu_list[selected_adapter_index], surface, enable_debug_utils,
-                            enable_validation_layer, vk_api_version);
+  g_vulkan_context = VulkanContext::Create(instance, selected_gpu, surface, enable_debug_utils,
+                                           enable_validation_layer, vk_api_version);
   if (!g_vulkan_context)
   {
     PanicAlertFmt("Failed to create Vulkan device");
     UnloadVulkanLibrary();
     return false;
   }
+
+  // MHTriVR Phase 3a: hand Dolphin's finished Vulkan handles to OpenXR for session
+  // creation (no-op in the default build / when inactive).
+  VROpenXR::CheckVulkanGraphicsRequirements(vk_api_version);
+  VROpenXR::SetBlitCallback(&MHTriVRBlit);
+  VROpenXR::SetVulkanBinding(instance, g_vulkan_context->GetPhysicalDevice(),
+                             g_vulkan_context->GetDevice(),
+                             g_vulkan_context->GetGraphicsQueueFamilyIndex(), 0);
 
   // Since VulkanContext maintains a copy of the device features and properties, we can use this
   // to initialize the backend information, so that we don't need to enumerate everything again.
@@ -210,7 +299,11 @@ bool VideoBackend::Initialize(const WindowSystemInfo& wsi)
   }
 
   // Create command buffers. We do this separately because the other classes depend on it.
-  g_command_buffer_mgr = std::make_unique<CommandBufferManager>(g_Config.bBackendMultithreading);
+  // MHTriVR Phase 3c: when OpenXR is active, force SINGLE-THREADED submission. The XR
+  // compositor submits to our VkQueue during xrEndFrame on the video thread; Dolphin's
+  // worker submit thread would race it on the same queue (VK_ERROR_DEVICE_LOST).
+  const bool threaded_submission = g_Config.bBackendMultithreading && !VROpenXR::IsInitialized();
+  g_command_buffer_mgr = std::make_unique<CommandBufferManager>(threaded_submission);
   size_t swapchain_image_count =
       surface != VK_NULL_HANDLE ? swap_chain->GetSwapChainImageCount() : 0;
   if (!g_command_buffer_mgr->Initialize(swapchain_image_count))

@@ -7,6 +7,7 @@
 #include "Common/CommonTypes.h"
 #include "VideoCommon/BPMemory.h"
 #include "VideoCommon/RenderState.h"
+#include "VideoCommon/VRStereo.h"
 #include "VideoCommon/VideoConfig.h"
 #include "VideoCommon/XFMemory.h"
 
@@ -50,9 +51,19 @@ void GeometryShaderManager::SetConstants(PrimitiveType prim)
   {
     m_projection_changed = false;
 
+    // MHTriVR Phase 2: when the VR stereo override is active, drive eye
+    // separation and convergence from VR-owned values instead of the GUI
+    // sliders (see VideoCommon/VRStereo.h). Inert until a stereo mode is on.
+    float convergence = g_ActiveConfig.stereo_convergence;
+
     if (xfmem.projection.type == ProjectionType::Perspective)
     {
-      const float offset = g_ActiveConfig.stereo_depth;
+      float offset = g_ActiveConfig.stereo_depth;
+      if (VRStereo::IsEnabled())
+      {
+        offset = VRStereo::GetDepth();
+        convergence = VRStereo::GetConvergence();
+      }
       constants.stereoparams[0] = g_ActiveConfig.bStereoSwapEyes ? offset : -offset;
       constants.stereoparams[1] = g_ActiveConfig.bStereoSwapEyes ? -offset : offset;
     }
@@ -61,7 +72,7 @@ void GeometryShaderManager::SetConstants(PrimitiveType prim)
       constants.stereoparams[0] = constants.stereoparams[1] = 0;
     }
 
-    constants.stereoparams[2] = g_ActiveConfig.stereo_convergence;
+    constants.stereoparams[2] = convergence;
 
     dirty = true;
   }

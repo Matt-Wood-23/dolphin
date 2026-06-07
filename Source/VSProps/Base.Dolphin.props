@@ -94,4 +94,24 @@
       <AdditionalOptions>/NODEFAULTLIB:msvcrt %(AdditionalOptions)</AdditionalOptions>
     </Link>
   </ItemDefinitionGroup>
+
+  <!--
+    MHTriVR Phase 3 (OpenXR/HMD). OFF by default: set the MSBuild property
+    MHTriVROpenXR=true (e.g. msbuild -p:MHTriVROpenXR=true) to build the VR
+    headset path. Only then is the MHTRI_VR_OPENXR define set, the vendored
+    OpenXR header dir added, and openxr_loader.lib linked. The default build
+    has no OpenXR define, no include, no lib, and no openxr_loader.dll runtime
+    dependency — so it stays byte-identical to the Phases 1-2 monitor build.
+    Loader vendored in Externals/OpenXR (headers + x64 loader, NuGet 1.0.10.2).
+  -->
+  <ItemDefinitionGroup Condition="'$(MHTriVROpenXR)'=='true'">
+    <ClCompile>
+      <PreprocessorDefinitions>MHTRI_VR_OPENXR;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ExternalsDir)OpenXR\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link Condition="'$(ConfigurationType)'=='Application' And '$(Platform)'=='x64'">
+      <AdditionalLibraryDirectories>$(ExternalsDir)OpenXR\lib\x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>openxr_loader.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
 </Project>

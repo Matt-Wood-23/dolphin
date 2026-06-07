@@ -16,6 +16,7 @@
 #include "VideoCommon/BPMemory.h"
 #include "VideoCommon/CPMemory.h"
 #include "VideoCommon/FramebufferManager.h"
+#include "VideoCommon/VROpenXR.h"
 #include "VideoCommon/FreeLookCamera.h"
 #include "VideoCommon/GraphicsModSystem/Runtime/GraphicsModActionData.h"
 #include "VideoCommon/GraphicsModSystem/Runtime/GraphicsModManager.h"
@@ -69,6 +70,18 @@ Common::Matrix44 VertexShaderManager::LoadProjectionMatrix()
 
     m_projection_matrix[14] = -1.0f;
     m_projection_matrix[15] = 0.0f;
+
+    // MHTriVR: widen the perspective FOV to roughly fill the HMD's wide FOV
+    // (reduces the "zoomed in" look). Uniform scale of the X/Y projection terms;
+    // a no-op (scale 1.0) outside VR. Tune live via MHTRI_VR_FOV_SCALE.
+    if (VROpenXR::IsActive())
+    {
+      const float vr_fov = VROpenXR::GetFovScale();
+      m_projection_matrix[0] *= vr_fov;
+      m_projection_matrix[2] *= vr_fov;
+      m_projection_matrix[5] *= vr_fov;
+      m_projection_matrix[6] *= vr_fov;
+    }
 
     g_stats.gproj = m_projection_matrix;
   }
