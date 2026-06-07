@@ -76,6 +76,14 @@ std::atomic<float> s_fp_yaw_sign{1.0f};      // +1/-1 flips facing rotation sens
 // live config reload can't clobber it. Calibration-free: we snap to the game's own
 // follow-cam azimuth (read at hook entry), which is in our world coordinates.
 std::atomic<float> s_fp_recenter{0.0f};
+// If the follow-cam direction points opposite the way you want to face, flip the
+// recenter/follow-base target 180° (live config `recenter_flip=1`).
+std::atomic<bool> s_fp_recenter_flip{false};
+// Follow-base mode (live `fp_follow_base=1`): the FP view YAW tracks the game's
+// follow-cam azimuth + head, instead of a fixed world offset. The follow-cam yaw is
+// driven by the RIGHT STICK (and is independent of body facing), so the right stick
+// turns the view — VR-style camera turn — with no spin. Supersedes recenter when on.
+std::atomic<bool> s_fp_follow_base{false};
 std::atomic<float> s_fp_head_yaw_sign{-1.0f};  // +1/-1 flips HMD yaw sense (Mode-A match)
 std::atomic<float> s_fp_head_pitch_sign{1.0f};  // +1/-1 flips HMD pitch sense
 constexpr u32 kPlayerWorkPtr = 0x806BBC74;   // -> player_work base
@@ -112,6 +120,10 @@ void ReadFPConfig()
       s_fp_head_yaw_sign.store(v);
     else if (std::sscanf(line, "fp_head_pitch_sign=%f", &v) == 1)
       s_fp_head_pitch_sign.store(v);
+    else if (std::sscanf(line, "recenter_flip=%d", &iv) == 1)
+      s_fp_recenter_flip.store(iv != 0);
+    else if (std::sscanf(line, "fp_follow_base=%d", &iv) == 1)
+      s_fp_follow_base.store(iv != 0);
   }
   std::fclose(f);
 }
@@ -249,27 +261,34 @@ void CamPostHook(const Core::CPUThreadGuard& guard)
       const float head_yaw = yaw * s_fp_head_yaw_sign.load();
       const float head_pitch = pitch * s_fp_head_pitch_sign.load();
 
-      // Snap-recenter (Right Ctrl, rising edge): re-aim the world-locked view at
-      // the hunter's CURRENT facing. The follow-cam's look direction (the ORIGINAL
-      // eye->target, still in g_cam_work at hook entry because cam_follow_update
-      // ran first) points where the body faces, in OUR world coords -> snap to it.
+      // The follow-cam's look direction = the ORIGINAL eye->target, still in
+      // g_cam_work at hook entry (cam_follow_update wrote it just before this
+      // commit). Its azimuth is driven by the RIGHT STICK, independent of body
+      // facing -> a clean, spin-free heading for both recenter and follow-base.
+      const float oex = rd(eye_ptr + 0), oez = rd(eye_ptr + 8);
+      const float otx = rd(tgt_ptr + 0), otz = rd(tgt_ptr + 8);
+      float az_follow = std::atan2(otx - oex, otz - oez);
+      if (s_fp_recenter_flip.load())
+        az_follow += kPi;  // face the opposite of the follow-cam direction
+
+      // Snap-recenter (Right Ctrl, rising edge): re-aim the world-locked view at the
+      // hunter's current facing. (Unused in follow-base mode, which auto-tracks.)
 #ifdef _WIN32
       static bool s_was_recenter = false;
       const bool recenter = (GetAsyncKeyState(VK_RCONTROL) & 0x8000) != 0;
       if (recenter && !s_was_recenter)
-      {
-        const float oex = rd(eye_ptr + 0), oez = rd(eye_ptr + 8);
-        const float otx = rd(tgt_ptr + 0), otz = rd(tgt_ptr + 8);
-        const float az_follow = std::atan2(otx - oex, otz - oez);
-        // Solve recenter so total_yaw (below) == az_follow at this instant.
         s_fp_recenter.store(az_follow - facing * s_fp_yaw_sign.load() -
                             s_fp_yaw_offset.load() - head_yaw);
-      }
       s_was_recenter = recenter;
 #endif
 
-      const float total_yaw = facing * s_fp_yaw_sign.load() + s_fp_yaw_offset.load() +
-                              s_fp_recenter.load() + head_yaw;
+      // Follow-base: view yaw tracks the right-stick-driven follow azimuth + head
+      // (VR camera turn). Otherwise: fixed world offset + snap-recenter.
+      const float total_yaw =
+          s_fp_follow_base.load() ?
+              (az_follow + s_fp_yaw_offset.load() + head_yaw) :
+              (facing * s_fp_yaw_sign.load() + s_fp_yaw_offset.load() +
+               s_fp_recenter.load() + head_yaw);
       const float cp = std::cos(head_pitch);
       const float fx = std::sin(total_yaw) * cp;
       const float fy = std::sin(head_pitch);
