@@ -52,6 +52,26 @@ std::atomic<float> s_head_pitch{0.0f};
 std::atomic<bool> s_pose_valid{false};
 std::atomic<float> s_fov_scale{1.0f};
 
+// Presentation mode: false => flat two-quad virtual screen; true => wrap-around
+// projection layer (immersion). Toggle live via `immersion=` in the config.
+std::atomic<bool> s_immersion{false};
+// Quad screen geometry (metres) — live-tunable so the flat screen can be grown
+// into a big "cinema"/IMAX screen that fills most of the FOV while still fusing.
+std::atomic<float> s_quad_width{2.4f};
+std::atomic<float> s_quad_dist{2.0f};
+// FOV the game ACTUALLY rendered with this frame, as half-angle tangents, pushed
+// from VertexShaderManager. The projection layer reports this verbatim so the
+// rendered and reported frustums match exactly -> guaranteed fusion (lowering
+// fov_scale widens both together until the image fills the HMD = immersion).
+std::atomic<float> s_render_tan_h{1.0f};
+std::atomic<float> s_render_tan_v{1.0f};
+// Per-eye poses captured in RunFrame, reused by the projection layer in EndFrame
+// (video thread, same frame). A projection layer positions each eye's image by
+// THIS pose, so each view MUST get its own eye pose or the images shift apart by
+// the IPD and double between the eyes.
+XrPosef s_eye_poses[2] = {{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}},
+                          {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}}};
+
 // Dolphin's Vulkan handles, captured via SetVulkanBinding for session creation.
 VkInstance s_vk_instance = VK_NULL_HANDLE;
 VkPhysicalDevice s_vk_physical_device = VK_NULL_HANDLE;
@@ -197,12 +217,19 @@ void ReadVRConfig()
   while (std::fgets(line, sizeof(line), f) != nullptr)
   {
     float v = 0.0f;
+    int iv = 0;
     if (std::sscanf(line, "fov_scale=%f", &v) == 1)
       SetFovScale(v);
     else if (std::sscanf(line, "depth=%f", &v) == 1)
       VRStereo::SetDepth(v);
     else if (std::sscanf(line, "convergence=%f", &v) == 1)
       VRStereo::SetConvergence(v);
+    else if (std::sscanf(line, "immersion=%d", &iv) == 1)
+      s_immersion.store(iv != 0);
+    else if (std::sscanf(line, "quad_width=%f", &v) == 1)
+      s_quad_width.store(v);
+    else if (std::sscanf(line, "quad_dist=%f", &v) == 1)
+      s_quad_dist.store(v);
   }
   std::fclose(f);
 }
@@ -489,6 +516,14 @@ float GetFovScale()
   return s_fov_scale.load();
 }
 
+void SetRenderFov(float tan_half_h, float tan_half_v)
+{
+  if (tan_half_h > 0.01f && tan_half_h < 20.0f)
+    s_render_tan_h.store(tan_half_h);
+  if (tan_half_v > 0.01f && tan_half_v < 20.0f)
+    s_render_tan_v.store(tan_half_v);
+}
+
 namespace
 {
 // Pump the session lifecycle events. Begins/ends the session on READY/STOPPING.
@@ -596,6 +631,10 @@ void RunFrame(const AbstractTexture* xfb_stereo_array)
     s_head_yaw.store(yaw);
     s_head_pitch.store(pitch);
     s_pose_valid.store(true);
+    // Keep each eye's located pose for the projection layer in EndFrame — each
+    // view must use its OWN eye pose (the IPD separation) or the eyes double.
+    s_eye_poses[0] = views[0].pose;
+    s_eye_poses[1] = views[1].pose;
   }
 
   // Submit only when we have a source + a backend blit.
@@ -649,36 +688,80 @@ void EndFrame()
     }
   }
 
-  // Flat virtual screen, head-locked (always in front), ~2.4m wide at 2m. Two
-  // quads at the SAME pose/size, one per eye, each fed its own eye's render: the
-  // eyes fuse into one screen while keeping the per-eye parallax (stereo depth).
-  // 16:9 quad so the XFB (stretched to fill the square swapchain) reads correctly.
-  static const XrEyeVisibility kEyeVis[kEyeCount] = {XR_EYE_VISIBILITY_LEFT,
-                                                     XR_EYE_VISIBILITY_RIGHT};
-  XrCompositionLayerQuad quads[kEyeCount];
   const XrCompositionLayerBaseHeader* layers[kEyeCount];
-  for (u32 e = 0; e < kEyeCount; ++e)
+  u32 layer_count = 0;
+
+  // These outlive the xrEndFrame call below (referenced by `layers`).
+  XrCompositionLayerProjection proj{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+  XrCompositionLayerQuad quads[kEyeCount];
+
+  if (s_immersion.load())
   {
-    XrCompositionLayerQuad& quad = quads[e];
-    quad = XrCompositionLayerQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
-    quad.layerFlags = 0;
-    quad.space = s_view_space;
-    quad.eyeVisibility = kEyeVis[e];
-    quad.subImage.swapchain = s_swapchains[e];
-    quad.subImage.imageRect.offset = {0, 0};
-    quad.subImage.imageRect.extent = {static_cast<int32_t>(s_eye_width[e]),
-                                      static_cast<int32_t>(s_eye_height[e])};
-    quad.subImage.imageArrayIndex = 0;
-    quad.pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
-    quad.pose.position = {0.0f, 0.0f, -2.0f};
-    quad.size = {2.4f, 2.4f * 9.0f / 16.0f};
-    layers[e] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad);
+    // Immersion: a single projection layer (wrap-around), one view per eye. We
+    // report the EXACT fov the game rendered with (pushed from VertexShaderManager
+    // as half-angle tangents), so rendered frustum == reported frustum -> the
+    // image fuses and fills the HMD. Both eye views share the head pose; depth
+    // comes from the GS-shear content, not from per-eye IPD poses.
+    const float ah = std::atan(s_render_tan_h.load());
+    const float av = std::atan(s_render_tan_v.load());
+    for (u32 e = 0; e < kEyeCount; ++e)
+    {
+      s_proj_views[e] = XrCompositionLayerProjectionView{
+          XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
+      // Head-locked identity pose (like the fused quad): the game content is
+      // ALREADY rendered looking in the head direction (camera hook), so applying
+      // the head orientation again here would double-count it and break fusion.
+      // Both eyes straight ahead from the head; depth comes from GS-shear content.
+      s_proj_views[e].pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+      s_proj_views[e].pose.position = {0.0f, 0.0f, 0.0f};
+      s_proj_views[e].fov = {-ah, ah, av, -av};  // L, R, U, D (radians)
+      s_proj_views[e].subImage.swapchain = s_swapchains[e];
+      s_proj_views[e].subImage.imageRect.offset = {0, 0};
+      s_proj_views[e].subImage.imageRect.extent = {
+          static_cast<int32_t>(s_eye_width[e]), static_cast<int32_t>(s_eye_height[e])};
+      s_proj_views[e].subImage.imageArrayIndex = 0;
+    }
+    proj.layerFlags = 0;
+    proj.space = s_view_space;  // VIEW (head-locked) — content is already head-aimed
+    proj.viewCount = kEyeCount;
+    proj.views = s_proj_views;
+    layers[0] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&proj);
+    layer_count = 1;
+  }
+  else
+  {
+    // Flat virtual screen, head-locked (always in front), ~2.4m wide at 2m. Two
+    // quads at the SAME pose/size, one per eye, each fed its own eye's render: the
+    // eyes fuse into one screen while keeping the per-eye parallax (stereo depth).
+    // 16:9 quad so the XFB (stretched to fill the square swapchain) reads correctly.
+    static const XrEyeVisibility kEyeVis[kEyeCount] = {XR_EYE_VISIBILITY_LEFT,
+                                                       XR_EYE_VISIBILITY_RIGHT};
+    for (u32 e = 0; e < kEyeCount; ++e)
+    {
+      XrCompositionLayerQuad& quad = quads[e];
+      quad = XrCompositionLayerQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
+      quad.layerFlags = 0;
+      quad.space = s_view_space;
+      quad.eyeVisibility = kEyeVis[e];
+      quad.subImage.swapchain = s_swapchains[e];
+      quad.subImage.imageRect.offset = {0, 0};
+      quad.subImage.imageRect.extent = {static_cast<int32_t>(s_eye_width[e]),
+                                        static_cast<int32_t>(s_eye_height[e])};
+      quad.subImage.imageArrayIndex = 0;
+      const float qw = s_quad_width.load();
+      const float qd = s_quad_dist.load();
+      quad.pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+      quad.pose.position = {0.0f, 0.0f, -qd};
+      quad.size = {qw, qw * 9.0f / 16.0f};
+      layers[e] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad);
+    }
+    layer_count = kEyeCount;
   }
 
   XrFrameEndInfo end_info{XR_TYPE_FRAME_END_INFO};
   end_info.displayTime = s_predicted_display_time;
   end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-  end_info.layerCount = s_should_submit ? kEyeCount : 0u;
+  end_info.layerCount = s_should_submit ? layer_count : 0u;
   end_info.layers = s_should_submit ? layers : nullptr;
   s_last_endframe = xrEndFrame(s_session, &end_info);
 
@@ -819,6 +902,9 @@ void SetFovScale(float /*scale*/)
 float GetFovScale()
 {
   return 1.0f;
+}
+void SetRenderFov(float /*tan_half_h*/, float /*tan_half_v*/)
+{
 }
 void RunFrame(const AbstractTexture* /*xfb_stereo_array*/)
 {

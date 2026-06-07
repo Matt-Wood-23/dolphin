@@ -52,6 +52,13 @@ bool IsActive();
 void SetFovScale(float scale);
 float GetFovScale();
 
+// Push the FOV the game ACTUALLY rendered with this frame (half-angle tangents:
+// tan(h/2), tan(v/2), derived from the projection matrix in VertexShaderManager).
+// The immersion projection layer reports this verbatim so the rendered and
+// reported frustums match exactly -> the image fuses and fills the HMD. No-op in
+// the default build / when no session is active.
+void SetRenderFov(float tan_half_h, float tan_half_v);
+
 // Drive the per-frame OpenXR loop: poll the session state machine, wait/begin the
 // frame, locate the head pose (stored for GetHeadPose), acquire the eye swapchain
 // images and record the XFB blit into them. Called once per frame from

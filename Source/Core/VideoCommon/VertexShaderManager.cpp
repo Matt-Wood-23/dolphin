@@ -81,6 +81,14 @@ Common::Matrix44 VertexShaderManager::LoadProjectionMatrix()
       m_projection_matrix[2] *= vr_fov;
       m_projection_matrix[5] *= vr_fov;
       m_projection_matrix[6] *= vr_fov;
+
+      // Report the FOV we just rendered with so the immersion projection layer can
+      // claim the exact same frustum (m[0]=1/tan(h/2), m[5]=1/tan(v/2)). Matching
+      // rendered==reported is what makes the image fuse and fill the HMD.
+      const float sx = std::abs(m_projection_matrix[0]);
+      const float sy = std::abs(m_projection_matrix[5]);
+      if (sx > 1.0e-4f && sy > 1.0e-4f)
+        VROpenXR::SetRenderFov(1.0f / sx, 1.0f / sy);
     }
 
     g_stats.gproj = m_projection_matrix;
