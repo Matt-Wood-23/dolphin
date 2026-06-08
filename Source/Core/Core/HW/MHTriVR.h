@@ -1,16 +1,22 @@
 // Copyright 2026 Dolphin Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-// Monster Hunter Tri (RMHE08) VR camera injection — Phase 1 (head-look).
+// VR camera injection — the game-specific half of the VR mod.
 //
-// Rewrites the camera's look target each frame so head movement steers the
-// in-game view. Hooked at 0x802be0f4 — cam_commit_to_g3d, the camera COMMIT
-// that pushes eye+target into the nw4r g3d Camera (SetPosture/SetPerspective)
-// that the renderer actually reads. At entry r4 = eye vec3 ptr, r5 = target
-// vec3 ptr; the hook rotates *target about *eye by the current head yaw/pitch.
-// (Writing g_cam_work is a frame too late — the commit already happened.)
-// See facts/01_memory_map.md "Camera update pipeline & VR injection point" and
-// reports/vr_mod_plan.md in the mhtri_reversing project.
+// Despite the historical name, this module is multi-game: it drives whatever
+// title has a profile in Core/HW/VRGameProfiles.h. It rewrites the camera's
+// eye/look-target each frame so head movement (and, in first-person mode, the
+// player's own position/facing) steers the in-game view. We hook the engine's
+// camera COMMIT — the function that pushes eye+target into the GPU/scene-graph
+// camera the renderer reads — and overwrite the two vec3s it is about to commit
+// (hooking the commit, not the camera update, lets the game's camera code run
+// untouched). The hook address and the GPRs holding the eye/target pointers are
+// per-game and come from the active profile.
+//
+// Reference title MH Tri (RMHE08): hook 0x802be0f4 = cam_commit_to_g3d, r4 = eye
+// vec3 ptr, r5 = target vec3 ptr. See facts/01_memory_map.md "Camera update
+// pipeline & VR injection point" and reports/vr_mod_plan.md in mhtri_reversing,
+// and docs/ADDING_A_GAME.md in the mhtri-vr repo for porting to a new game.
 //
 // This is the camera half of the VR plan; stereo rendering and OpenXR
 // presentation are separate phases. The pose source is pluggable: an OpenXR

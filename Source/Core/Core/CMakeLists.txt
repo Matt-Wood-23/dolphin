@@ -267,6 +267,7 @@ add_library(core
   HW/Memmap.h
   HW/MHTriVR.cpp
   HW/MHTriVR.h
+  HW/VRGameProfiles.h
   HW/MemoryInterface.cpp
   HW/MemoryInterface.h
   HW/MMIO.cpp

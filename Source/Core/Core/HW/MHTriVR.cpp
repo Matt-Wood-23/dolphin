@@ -3,6 +3,8 @@
 
 #include "Core/HW/MHTriVR.h"
 
+#include "Core/HW/VRGameProfiles.h"
+
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -39,14 +41,17 @@ namespace
 {
 constexpr float kPi = 3.14159265358979323846f;
 
-// Hook site (NTSC-U / RMHE08). FUN_802be0f4 is the camera COMMIT: it pushes
-// eye+target into the nw4r g3d Camera (SetPosture/SetPerspective) that the
-// renderer reads. Writing g_cam_work directly is too late because the commit
-// already happened. At entry: r4 = eye vec3 ptr, r5 = target vec3 ptr (args).
-// See facts/01_memory_map.md.
-constexpr u32 kHookAddr = 0x802be0f4;   // cam commit (SetPosture/SetPerspective)
-constexpr u32 kEyePtrReg = 4;           // r4 = eye vec3 pointer
-constexpr u32 kTargetPtrReg = 5;        // r5 = target (look-at) vec3 pointer
+// The active game's VR profile: camera-commit hook + player-state layout. Picked
+// by Game ID in TryInstall(); null until a supported title boots. Every per-game
+// address/offset lives in Core/HW/VRGameProfiles.h — adding a game is one row
+// there, with no changes in this file. See docs/ADDING_A_GAME.md.
+//
+// The reference title (RMHE08, MH Tri): the hook is cam_commit_to_g3d, which
+// pushes eye+target into the nw4r g3d Camera (SetPosture/SetPerspective) the
+// renderer reads. Hooking the commit (rather than the camera update) means the
+// game's own camera code can run untouched; we just rewrite what it commits.
+// At entry r4 = eye vec3 ptr, r5 = target vec3 ptr. See facts/01_memory_map.md.
+const VR::GameProfile* s_profile = nullptr;
 
 std::atomic<bool> s_enabled{true};
 std::atomic<float> s_yaw{0.0f};
@@ -87,9 +92,10 @@ std::atomic<bool> s_fp_recenter_flip{false};
 std::atomic<bool> s_fp_follow_base{false};
 std::atomic<float> s_fp_head_yaw_sign{-1.0f};  // +1/-1 flips HMD yaw sense (Mode-A match)
 std::atomic<float> s_fp_head_pitch_sign{1.0f};  // +1/-1 flips HMD pitch sense
-constexpr u32 kPlayerWorkPtr = 0x806BBC74;   // -> player_work base
-constexpr u32 kPlwPosOff = 0x48;             // vec3 current position
-constexpr u32 kPlwFacingOff = 0xD8;          // s16 facing yaw (BAMS)
+// player_work pointer + struct offsets now come from the active profile:
+//   s_profile->player_work_ptr -> player_work base
+//   s_profile->pos_off    = vec3 current position
+//   s_profile->facing_off = s16 facing yaw (BAMS)
 
 // Live config (shared with VROpenXR's reader): mhtri_vr_config.txt next to the
 // Dolphin executable. Re-read every N frames from the CPU thread so eye-height /
@@ -196,6 +202,8 @@ void CamPostHook(const Core::CPUThreadGuard& guard)
 {
   if (!s_enabled.load())
     return;
+  if (s_profile == nullptr)  // hook should not be installed without a profile
+    return;
 
   // Refresh the head pose from the live input driver (mouse) before applying it.
   // An external OpenXR pose, if set, still wins below.
@@ -205,9 +213,9 @@ void CamPostHook(const Core::CPUThreadGuard& guard)
   auto& system = guard.GetSystem();
   const auto& ppc_state = system.GetPPCState();
 
-  // Args at the commit: r4 = eye ptr, r5 = target ptr.
-  const u32 eye_ptr = ppc_state.gpr[kEyePtrReg];
-  const u32 tgt_ptr = ppc_state.gpr[kTargetPtrReg];
+  // Args at the commit (per profile): eye ptr and target ptr GPRs.
+  const u32 eye_ptr = ppc_state.gpr[s_profile->eye_ptr_reg];
+  const u32 tgt_ptr = ppc_state.gpr[s_profile->target_ptr_reg];
   const auto in_mem1 = [](u32 a) { return a >= 0x80000000 && a < 0x81800000; };
   if (!in_mem1(eye_ptr) || !in_mem1(tgt_ptr))
     return;
@@ -253,14 +261,14 @@ void CamPostHook(const Core::CPUThreadGuard& guard)
     const auto in_ram = [](u32 a) {
       return (a >= 0x80000000 && a < 0x81800000) || (a >= 0x90000000 && a < 0x94000000);
     };
-    const u32 plw = PowerPC::MMU::HostRead<u32>(guard, kPlayerWorkPtr);
+    const u32 plw = PowerPC::MMU::HostRead<u32>(guard, s_profile->player_work_ptr);
     if (in_ram(plw))
     {
-      const float px = rd(plw + kPlwPosOff + 0);
-      const float py = rd(plw + kPlwPosOff + 4);
-      const float pz = rd(plw + kPlwPosOff + 8);
+      const float px = rd(plw + s_profile->pos_off + 0);
+      const float py = rd(plw + s_profile->pos_off + 4);
+      const float pz = rd(plw + s_profile->pos_off + 8);
       const auto facing_bams =
-          static_cast<s16>(PowerPC::MMU::HostRead<u16>(guard, plw + kPlwFacingOff));
+          static_cast<s16>(PowerPC::MMU::HostRead<u16>(guard, plw + s_profile->facing_off));
       const float facing = static_cast<float>(facing_bams) * (2.0f * kPi / 65536.0f);
       // HMD yaw sense must match the working Mode-A head-look (azimuth decreases
       // with +head-yaw), hence the per-axis head sign knobs.
@@ -374,9 +382,12 @@ void CamPostHook(const Core::CPUThreadGuard& guard)
 
 void TryInstall(Core::System& system)
 {
+  // Pick the VR profile for the running title. Any unsupported game is a no-op.
   const std::string game_id = SConfig::GetInstance().GetGameID();
-  if (game_id != "RMHE08")
+  const VR::GameProfile* profile = VR::FindProfile(game_id);
+  if (profile == nullptr)
     return;
+  s_profile = profile;
 
   // Opt-out: MHTRI_VR=0 skips installation entirely.
   if (const char* off = std::getenv("MHTRI_VR"); off != nullptr && off[0] == '0')
@@ -429,11 +440,11 @@ void TryInstall(Core::System& system)
   // this brings up the OpenXR instance and logs whether the HMD is detected.
   VROpenXR::Initialize();
 
-  HLE::Patch(system, kHookAddr, "MHTriVRCamPost");
+  HLE::Patch(system, profile->hook_addr, "MHTriVRCamPost");
   INFO_LOG_FMT(CORE,
-               "MHTriVR: installed camera VR hook at {:#010x} (RMHE08) "
+               "MHTriVR: installed camera VR hook at {:#010x} ({}) "
                "[mouse={}, demo={}, stereo={} depth={} conv={}]",
-               kHookAddr, s_mouse.load(), s_demo.load(), VRStereo::IsEnabled(),
-               VRStereo::GetDepth(), VRStereo::GetConvergence());
+               profile->hook_addr, profile->name, s_mouse.load(), s_demo.load(),
+               VRStereo::IsEnabled(), VRStereo::GetDepth(), VRStereo::GetConvergence());
 }
 }  // namespace MHTriVR

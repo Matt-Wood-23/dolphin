@@ -326,6 +326,7 @@
     <ClInclude Include="Core\HW\MagCard\MagneticCardReader.h" />
     <ClInclude Include="Core\HW\Memmap.h" />
     <ClInclude Include="Core\HW\MHTriVR.h" />
+    <ClInclude Include="Core\HW\VRGameProfiles.h" />
     <ClInclude Include="Core\HW\MemoryInterface.h" />
     <ClInclude Include="Core\HW\MMIO.h" />
     <ClInclude Include="Core\HW\MMIOHandlers.h" />
